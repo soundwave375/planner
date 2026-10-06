@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <sstream>
 #include <cwchar>
+#include "planner.h"
+#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:WinMainCRTStartup")
 
 // Идентификаторы
 #define ID_BTN_BUILD       1001
@@ -21,23 +23,16 @@
 #define ID_COMBO_FILTER    1014
 #define ID_BTN_FILTER      1015
 
+#include "database.h"
+
 using namespace std;
 
-// Структуры
-struct DateTime { int year, month, day, hour; };
-struct TimeInterval { DateTime start, end; wstring reason; };
-struct order { int ID_order; DateTime order_date, date_start, deadline; int fine, TP_ID; };
-struct operation { int ID_operation; wstring name; int duration; };
-struct technical_process { int ID_tp; vector<int> operation_ids; };
-struct resource { int ID_resource; wstring name1; wstring name2; bool is_machine; vector<TimeInterval> assigned_intervals; };
-struct ScheduleItem { int orderID, opID, resourceID; DateTime start, end; };
-
 // Глобальные данные
-vector<resource> machines = { {101, L"ЧПУ", L"Alpha", true} };
-vector<resource> workers = { {1001, L"Иванов", L"И.", false} };
-vector<order> orders = { {1, {2025,3,1,10}, {2025,3,5,8}, {2025,3,10,18}, 50000, 500} };
-vector<operation> allOps = { {10, L"Этап 1", 3}, {11, L"Этап 2", 2}, {12, L"Этап 3", 1} };
-vector<technical_process> allTPs = { {500, {10, 11, 12}} };
+vector<resource> machines;
+vector<resource> workers;
+vector<order> orders;
+vector<operation> allOps;
+vector<technical_process> allTPs;
 vector<ScheduleItem> lastResult;
 int g_filterOrderId = 0;
 HWND hListBox, hEditName, hComboFilter;
@@ -73,17 +68,64 @@ bool isResourceAvailable(const resource& res, DateTime start, DateTime end) {
     return true;
 }
 
+// функция для подсчёта суммарной длительности техпроцесса для конкретного заказа
+int getOrderTotalDuration(const order& ord, const vector<operation>& allOps, const vector<technical_process>& allTPs) {
+    int total = 0;
+    for (const auto& tp : allTPs) {
+        if (tp.ID_tp == ord.TP_ID) {
+            for (int opID : tp.operation_ids) {
+                for (const auto& op : allOps) {
+                    if (op.ID_operation == opID) {
+                        total += op.duration;
+                    }
+                }
+            }
+        }
+    }
+    return total;
+}
+
+//функция сортировки
+void sort_orders(vector<order>& orders_list, const string& rule, const vector<operation>& allOps, const vector<technical_process>& allTPs) {
+    if (rule == "FIFO") {
+        // По порядку поступления (по ID заказа)
+        sort(orders_list.begin(), orders_list.end(), [](const order& a, const order& b) {
+            return a.ID_order < b.ID_order;
+            });
+    }
+    else if (rule == "EDD") {
+        // По возрастанию срока дедлайна (сначала самые срочные)
+        sort(orders_list.begin(), orders_list.end(), [](const order& a, const order& b) {
+            return toTotalHours(a.deadline) < toTotalHours(b.deadline);
+            });
+    }
+    else if (rule == "SPT") {
+        // Сначала короткие заказы (по суммарной длительности техпроцесса)
+        sort(orders_list.begin(), orders_list.end(), [&](const order& a, const order& b) {
+            return getOrderTotalDuration(a, allOps, allTPs) < getOrderTotalDuration(b, allOps, allTPs);
+            });
+    }
+    else if (rule == "LPT") {
+        // Сначала длинные заказы
+        sort(orders_list.begin(), orders_list.end(), [&](const order& a, const order& b) {
+            return getOrderTotalDuration(a, allOps, allTPs) > getOrderTotalDuration(b, allOps, allTPs);
+            });
+    }
+    else if (rule == "WSPT") {
+        // По убыванию отношения (вес заказа / длительность)
+        sort(orders_list.begin(), orders_list.end(), [&](const order& a, const order& b) {
+            double ratioA = (double)a.weight / getOrderTotalDuration(a, allOps, allTPs);
+            double ratioB = (double)b.weight / getOrderTotalDuration(b, allOps, allTPs);
+            return ratioA > ratioB;
+            });
+    }
+}
+
 // Построение расписания
 static void buildSchedule(vector<order>& orders, vector<resource>& machines, vector<resource>& workers,
     vector<operation>& allOps, vector<technical_process>& allTPs, vector<ScheduleItem>& result)
 {
-    sort(orders.begin(), orders.end(),
-        [](const order& a, const order& b) {
-            long long tA = toTotalHours(a.order_date);
-            long long tB = toTotalHours(b.order_date);
-            if (tA != tB) return tA < tB;
-            return a.fine > b.fine;
-        });
+    sort_orders(orders, "WSPT", allOps, allTPs);
 
     result.clear();
     for (auto& m : machines) m.assigned_intervals.clear();
@@ -390,8 +432,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (LOWORD(wp) == ID_BTN_BUILD) {
             SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+
+            Database db("host=localhost port=5432 dbname=plannerbuildSchedule  user=postgres password=equius");
+            vector<resource> allResources = db.getResources();
+            machines.clear();
+            workers.clear();
+            for (const auto& r : allResources) {
+                if (r.is_machine) {
+                    machines.push_back(r);
+                }
+                else {
+                    workers.push_back(r);
+                }
+            }
+            orders = db.getOrders();
+            allOps = db.getAllOperations();
+            allTPs = db.getAllProcesses();
+
+            // запуск стандартного алгоритма планирования
             buildSchedule(orders, machines, workers, allOps, allTPs, lastResult);
 
+            // автоматически сохраняем полученное расписание в базу данных PostgreSQL
+            db.saveSchedule(lastResult);
+            db.exportScheduleToCSV("schedule.csv");
+
+            // стандартный вывод результатов на экран приложения
             for (auto& i : lastResult) {
                 wstring resName = GetResourceNameByID(i.resourceID);
                 wstring s = to_wstring(i.start.day) + L"." + to_wstring(i.start.month) + L" | " +
@@ -532,6 +597,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int n) {
+    // подключаемся к базе данных
+    string conn_str = "host=localhost port=5432 dbname=planner user=postgres password=equius";
+    Database db(conn_str);
+
+    // инициализируем базу из CSV-файлов при первом запуске
+    db.initFromCSV();
+
+    // загружаем свежие данные из базы в программу
+    vector<resource> allResources = db.getResources();
+    machines.clear();
+    workers.clear();
+    for (const auto& r : allResources) {
+        if (r.is_machine) {
+            machines.push_back(r);
+        }
+        else {
+            workers.push_back(r);
+        }
+    }
+    orders = db.getOrders();
+
+
     WNDCLASS wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = h;
@@ -549,4 +636,38 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int n) {
         DispatchMessage(&msg);
     }
     return 0;
+}
+
+struct ScheduleEvaluation {
+    long long totalWeightedFine;
+    int delayedOrdersCount;
+    long long maxDelay;
+    long long lastOperationEnd;
+};
+
+ScheduleEvaluation evaluateSchedule(const vector<order>& orders_list, const vector<ScheduleItem>& result) {
+    ScheduleEvaluation eval = { 0, 0, 0, 0 };
+
+    for (const auto& ord : orders_list) {
+        long long maxEnd = 0;
+        for (const auto& item : result) {
+            if (item.orderID == ord.ID_order) {
+                long long endT = toTotalHours(item.end);
+                if (endT > maxEnd) maxEnd = endT;
+            }
+        }
+
+        if (maxEnd > eval.lastOperationEnd) eval.lastOperationEnd = maxEnd;
+
+        long long dlTime = toTotalHours(ord.deadline);
+        if (maxEnd > dlTime) {
+            long long delay = maxEnd - dlTime;
+            eval.delayedOrdersCount++;
+            if (delay > eval.maxDelay) eval.maxDelay = delay;
+
+            // взвешенный штраф: часы просрочки * ставка штрафа * вес заказа
+            eval.totalWeightedFine += delay * ord.fine * ord.weight;
+        }
+    }
+    return eval;
 }
