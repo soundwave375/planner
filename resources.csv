@@ -1,0 +1,6 @@
+id;name;type
+1;ЧПУ Alpha;machine
+2;ЧПУ Beta;machine
+3;Иванов И.И. (Токарь);employee
+4;Петров П.П. (Фрезеровщик);employee
+5;Сидоров С.С. (Контролер);employee
