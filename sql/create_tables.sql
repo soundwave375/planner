@@ -1,3 +1,10 @@
+-- Очистка старой структуры перед созданием
+DROP TABLE IF EXISTS schedule_item CASCADE;
+DROP TABLE IF EXISTS "order" CASCADE;
+DROP TABLE IF EXISTS operation CASCADE;
+DROP TABLE IF EXISTS process CASCADE;
+DROP TABLE IF EXISTS resource CASCADE;
+
 -- 1. Таблица техпроцессов
 CREATE TABLE process (
     id SERIAL PRIMARY KEY,
@@ -27,7 +34,7 @@ CREATE TABLE "order" (
     id SERIAL PRIMARY KEY,
     process_id INT NOT NULL,
     quantity INT NOT NULL,
-    date_start TIMESTAMP,
+    date_start TIMESTAMP NOT NULL,
     deadline TIMESTAMP NOT NULL,
     fine REAL NOT NULL DEFAULT 0.0,
     weight REAL NOT NULL DEFAULT 1.0,
